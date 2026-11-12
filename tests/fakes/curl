@@ -1,0 +1,16 @@
+#!/bin/sh
+# fake curl: accepts the options csw uses; fails the test if a secret is in argv
+case "$*" in *SECRET*|*REFRESH*) echo leak >>"$FAKE_STATE/leaks"; exit 99 ;; esac
+h='' b='' url=''
+while [ $# -gt 0 ]; do
+	case $1 in
+	-fsS | --tlsv1.2) ;;
+	-m | -A | --proto) shift ;;
+	-H) shift; h=${1#@} ;;
+	--data-binary) shift; b=${1#@} ;;
+	-*) echo "fake curl: unexpected option $1" >&2; exit 2 ;;
+	*) url=$1 ;;
+	esac
+	shift
+done
+exec "$FAKES/endpoint" "$url" "$h" "$b"

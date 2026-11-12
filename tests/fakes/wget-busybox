@@ -1,0 +1,16 @@
+#!/bin/sh
+# fake BusyBox wget: no --version, headers via --header (secrets in argv are expected here)
+[ "${1-}" = --version ] && { echo "wget: unrecognized option '--version'" >&2; exit 1; }
+h=$(mktemp) b='' url=''
+while [ $# -gt 0 ]; do
+	case $1 in
+	-q) ;;
+	-O | -T | -U) shift ;;
+	--header) shift; printf '%s\n' "$1" >>"$h" ;;
+	--post-file) shift; b=$1 ;;
+	-*) echo "fake BusyBox wget: unexpected option $1" >&2; exit 2 ;;
+	*) url=$1 ;;
+	esac
+	shift
+done
+rc=0; "$FAKES/endpoint" "$url" "$h" "$b" || rc=$?; rm -f "$h"; exit $rc

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Emulates Anthropic's token and usage endpoints for the tests.
+# endpoint URL HEADERS_FILE [BODY_FILE]: prints the response, exits 22 on an HTTP error.
+url=$1 hdrs=$2 body=${3-}
+case $url in
+*/token)
+	[ -n "$body" ] && grep -q '"grant_type":"refresh_token"' "$body" && grep -q '"refresh_token":"REFRESH-' "$body" &&
+		grep -qi '^Content-Type: application/json' "$hdrs" || exit 22
+	n=$(($(cat "$FAKE_STATE/refreshes" 2>/dev/null || echo 0) + 1)); echo "$n" >"$FAKE_STATE/refreshes"
+	printf '{"access_token":"SECRET-fresh-%s","expires_in":28800,"refresh_token":"REFRESH-rotated","scope":"user:inference user:profile"}\n' "$n" ;;
+*/usage)
+	tok=$(sed -n 's/^Authorization: Bearer //p' "$hdrs")
+	grep -q '^anthropic-beta: oauth-2025-04-20$' "$hdrs" || exit 22
+	case $tok in SECRET-*fail*) exit 22 ;; SECRET-*) ;; *) exit 22 ;; esac
+	case $tok in *busy*) u=92 ;; *mid*) u=40 ;; *) u=10 ;; esac
+	printf '{"five_hour":{"utilization":%s,"resets_at":"2099-01-01T00:00:00.000000+00:00"},"seven_day":{"utilization":33.0,"resets_at":"2099-01-05T00:00:00+00:00"}}\n' "$u" ;;
+*) exit 6 ;;
+esac

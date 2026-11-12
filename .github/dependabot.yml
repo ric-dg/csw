@@ -1,0 +1,10 @@
+# keeps the commit-pinned actions in .github/workflows up to date (weekly PRs)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

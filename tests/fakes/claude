@@ -1,0 +1,4 @@
+#!/bin/sh
+# fake claude: reports which config dir it got; "auth login" may be slowed for the edit-safety test
+[ "${1-}" = auth ] && [ -n "${FAKE_SLOW_LOGIN-}" ] && sleep "$FAKE_SLOW_LOGIN"
+echo "CLAUDE dir=${CLAUDE_CONFIG_DIR:-unset} args=$*"

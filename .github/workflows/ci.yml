@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  # a newer push to the same branch or PR cancels the older run
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install shells and tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dash busybox jq shellcheck fish
+      - name: Lint
+        run: |
+          shellcheck csw install.sh tests/*.sh tests/fakes/* tools/*.sh
+          python3 -m py_compile tools/upstream-values.py
+      # every scenario under dash, bash and busybox ash, each with curl, GNU wget and BusyBox wget
+      - name: Test
+        run: SHELLS="dash bash busybox-ash" sh tests/run.sh

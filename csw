@@ -1,0 +1,613 @@
+#!/bin/sh
+# shellcheck shell=dash
+#
+# csw: one shared Claude Code across several accounts. See every account's limits,
+# pick one, and keep going in the same conversations.
+#
+#   csw                 interactive picker with every account's limits (fzf; plain menu without it)
+#   csw ls              table: 5-hour and 7-day usage and when they reset
+#   csw watch [SEC]     live table, refreshed every SEC seconds (default 120)
+#   csw use NAME        make NAME the account `claude` uses
+#   csw best            switch to the account with the most 5-hour room left
+#   csw run [ARGS]      start Claude with the current account (alias claude='csw run')
+#   csw auto [PCT|off]  on start, switch away when the current account's 5h use >= PCT
+#   csw add NAME        add an account (shares the ~/.claude history), then sign in
+#   csw login NAME      sign in again
+#   csw rm NAME         forget an account (asks you to retype the name)
+#   csw relink          re-apply the shared links
+#   csw init sh|fish    print a fast `claude` function for your shell rc (see below)
+#   csw doctor          check dependencies, accounts and file permissions
+#   csw version         print the version
+#
+# How it works: each account is its own CLAUDE_CONFIG_DIR under
+# ~/.local/share/claude-accounts/NAME, with its own login that only Claude Code and
+# csw touch. Conversations, memory, settings, skills and plugins there are symlinks
+# into ~/.claude, so every account can continue every conversation. Nothing is
+# copied between accounts, so no login can overwrite another. Expired logins are
+# refreshed under Claude Code's own lock protocol, and tokens never appear on a
+# command line (except with BusyBox wget, which csw warns about).
+#
+# Needs: a POSIX sh with `local` (dash, bash, BusyBox ash, zsh, mksh), Linux or WSL
+# (logins in ~/.claude*/.credentials.json), claude, jq >= 1.6, and curl or wget.
+# Optional: fzf. Uses the same unofficial endpoints as Claude Code's /usage.
+# Not affiliated with Anthropic. MIT licence. https://github.com/ric-dg/csw
+set -eu
+umask 077 # everything csw creates (logins, caches, temp files) is private
+
+CSW_VERSION=0.1.0
+SHARED=${CSW_SHARED:-$HOME/.claude}
+ROOT=${XDG_DATA_HOME:-$HOME/.local/share}/claude-accounts
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/claude-accounts
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/claude-accounts
+TTL=${CSW_TTL:-120} # seconds a usage reading is reused (the endpoint rate-limits)
+UA="csw/$CSW_VERSION"
+TOKEN_URL=${CSW_TOKEN_URL:-https://platform.claude.com/v1/oauth/token}
+USAGE_URL=${CSW_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}
+CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e # Claude Code's public OAuth client id
+BETA=oauth-2025-04-20
+SHARE_DIRS='projects file-history session-env todos plans skills agents commands output-styles plugins paste-cache'
+SHARE_FILES='history.jsonl settings.json CLAUDE.md'
+
+# Performance note: every $(...) and external command costs a fork (~1 ms on a slow
+# CPU). Hot paths (csw run, ls, best) set global variables instead of echoing through
+# $(...), use shell builtins (read, case, glob, kill -0), and batch the external
+# tools: one stat and one jq for all accounts, not one per account.
+
+# --- helpers -----------------------------------------------------------------
+die() { printf 'csw: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'csw: %s\n' "$*" >&2; }
+has() { command -v "$1" >/dev/null 2>&1; }
+
+valid_name() {
+	case $1 in '' | *[!A-Za-z0-9_-]*) die "account names: letters, digits, - and _" ;; esac
+}
+
+mtime() { # file modification time in epoch seconds (GNU/BusyBox, BSD, fallback)
+	stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || date -r "$1" +%s 2>/dev/null
+}
+
+self() {
+	case $0 in
+	/*) printf '%s\n' "$0" ;;
+	*) printf '%s/%s\n' "$(cd "$(dirname "$0")" && pwd)" "$(basename "$0")" ;;
+	esac
+}
+
+# the install command for this system's package manager
+install_hint() {
+	if has pacman; then echo "sudo pacman -S $*"
+	elif has apt-get; then echo "sudo apt install $*"
+	elif has dnf; then echo "sudo dnf install $*"
+	elif has zypper; then echo "sudo zypper install $*"
+	elif has apk; then echo "sudo apk add $*"
+	elif has brew; then echo "brew install $*"
+	else echo "install: $*"; fi
+}
+
+need() { # need CMD...: stop with the exact install command if any is missing
+	local c missing=''
+	for c; do has "$c" || missing="$missing $c"; done
+	# shellcheck disable=SC2086 # $missing is a word list on purpose
+	[ -z "$missing" ] || die "missing:$missing. Install with: $(install_hint $missing)"
+}
+
+# Pick the HTTP client once (inherited by the parallel fetches): curl, then GNU wget,
+# then BusyBox wget. Warns here, in the foreground, about BusyBox's argv headers.
+CSW_HTTP=''
+need_http() {
+	[ -z "$CSW_HTTP" ] || return 0
+	if has curl; then CSW_HTTP=curl
+	elif case $(wget --version 2>/dev/null) in *'GNU Wget'*) true ;; *) false ;; esac then CSW_HTTP=gnu-wget
+	elif has wget; then
+		CSW_HTTP=busybox-wget
+		warn "using BusyBox wget: tokens are visible in 'ps' to other local users during requests (install curl to avoid)"
+	else
+		die "missing: curl (or wget). Install with: $(install_hint curl)"
+	fi
+}
+
+need_net() { need jq; need_http; } # jq's version is checked by `csw doctor`, not on every run
+
+# --- accounts (results in globals: no subshell forks) --------------------------
+ACCOUNTS='' ACCOUNTS_LOADED='' CUR=''
+
+load_accounts() { # ACCOUNTS = space-separated names (names never contain spaces)
+	local d
+	[ -z "$ACCOUNTS_LOADED" ] || return 0
+	for d in "$ROOT"/*/; do
+		[ -d "$d" ] || continue
+		d=${d%/}
+		ACCOUNTS="$ACCOUNTS ${d##*/}"
+	done
+	ACCOUNTS=${ACCOUNTS# }
+	ACCOUNTS_LOADED=1
+}
+
+load_current() { # CUR = the current account, or the first one, or ''
+	CUR=''
+	if [ -r "$STATE/current" ]; then read -r CUR <"$STATE/current" || true; fi
+	if [ -z "$CUR" ] || [ ! -d "$ROOT/$CUR" ]; then
+		load_accounts
+		CUR=${ACCOUNTS%% *}
+	fi
+}
+
+set_current() {
+	[ -d "$STATE" ] || mkdir -p "$STATE"
+	echo "$1" >"$STATE/current"
+	CUR=$1
+}
+
+# A running Claude Code registers itself as sessions/<pid>.json in its config dir.
+# The pid must be alive and, where /proc exists, still be Claude (pids get reused):
+# the native build's process name is "claude", the npm build's is "node".
+in_use() {
+	local f pid comm
+	for f in "$ROOT/$1"/sessions/*.json; do
+		[ -e "$f" ] || continue
+		pid=${f##*/}
+		pid=${pid%.json}
+		case $pid in '' | *[!0-9]*) continue ;; esac
+		kill -0 "$pid" 2>/dev/null || continue
+		[ -r "/proc/$pid/comm" ] || return 0
+		comm=''
+		read -r comm <"/proc/$pid/comm" || true
+		case $comm in claude* | node*) return 0 ;; esac
+	done
+	return 1
+}
+
+# --- shared data ---------------------------------------------------------------
+share() { # point item $2 of account dir $1 at the shared copy; real files go to .unshared/
+	[ -L "$1/$2" ] && return 0
+	if [ -e "$1/$2" ]; then
+		mkdir -p "$1/.unshared"
+		mv "$1/$2" "$1/.unshared/$2.$(date +%Y%m%d-%H%M%S)"
+	fi
+	ln -s "$SHARED/$2" "$1/$2"
+}
+
+link() {
+	local d=$ROOT/$1 n
+	mkdir -p "$d"
+	chmod 700 "$d"
+	for n in $SHARE_DIRS; do
+		[ -d "$SHARED/$n" ] || mkdir -p "$SHARED/$n"
+		share "$d" "$n"
+	done
+	for n in $SHARE_FILES; do
+		if [ -e "$SHARED/$n" ]; then share "$d" "$n"; fi
+	done
+}
+
+# --- HTTP --------------------------------------------------------------------
+# http URL HEADERS_FILE [BODY_FILE]: GET (or POST the body) and print the response.
+# Headers and body come from private files, never argv, so tokens stay out of ps
+# (GNU wget gets them through a private --config file; BusyBox wget can only take
+# them in argv, see need_http). HTTPS URLs are forced to TLS 1.2+.
+http() {
+	local url=$1 hdrs=$2 body=${3-} line rc
+	need_http
+	case $CSW_HTTP in
+	curl)
+		set -- -fsS -m 15 -A "$UA" -H "@$hdrs"
+		case $url in https://*) set -- "$@" --proto '=https' --tlsv1.2 ;; esac
+		[ -z "$body" ] || set -- "$@" --data-binary "@$body"
+		curl "$@" "$url"
+		;;
+	gnu-wget)
+		sed 's/^/header = /' "$hdrs" >"$hdrs.wgetrc"
+		set -- -q -O - -T 15 -U "$UA" --config="$hdrs.wgetrc"
+		case $url in https://*) set -- "$@" --https-only --secure-protocol=TLSv1_2 ;; esac
+		[ -z "$body" ] || set -- "$@" --post-file="$body"
+		rc=0
+		wget "$@" "$url" || rc=$?
+		rm -f "$hdrs.wgetrc"
+		return $rc
+		;;
+	busybox-wget)
+		set --
+		while IFS= read -r line; do set -- "$@" --header "$line"; done <"$hdrs"
+		[ -z "$body" ] || set -- "$@" --post-file "$body"
+		wget -q -O - -T 15 -U "$UA" "$@" "$url"
+		;;
+	esac
+}
+
+# --- login refresh (Claude Code's proper-lockfile protocol) --------------------
+# A lock is a directory; a holder older than 60 s is stale. Claude Code takes
+# <config>/.oauth_refresh.lock and then the legacy <config>.lock, re-reads the
+# credentials, refreshes and saves. Doing the same means a running session and csw
+# never refresh the same login at once.
+lock() {
+	local i=0 m
+	while ! mkdir "$1" 2>/dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 20 ] || return 1
+		m=$(mtime "$1") || continue
+		if [ $(($(date +%s) - m)) -gt 60 ]; then rmdir "$1" 2>/dev/null || true; else sleep 1; fi
+	done
+}
+unlock() { rmdir "$1" 2>/dev/null || true; }
+
+# "expiring TOKEN" or "ok TOKEN" for a login file, in one jq call using jq's own clock
+login_state() {
+	jq -r '.claudeAiOauth // {} | "\(if ((.expiresAt // 0) / 1000) <= (now + 300) then "expiring" else "ok" end) \(.accessToken // "")"' "$1" 2>/dev/null
+}
+
+refresh() {
+	local d=$ROOT/$1 c=$ROOT/$1/.credentials.json rc=0 st tmp
+	lock "$d/.oauth_refresh.lock" || return 1
+	if ! lock "$d.lock"; then unlock "$d/.oauth_refresh.lock"; return 1; fi
+	st=$(login_state "$c") || st=expiring
+	if [ "${st%% *}" = expiring ]; then # still expiring after taking the lock (Claude may have just refreshed)
+		tmp=$d/.refresh.$$
+		echo 'Content-Type: application/json' >"$tmp.headers"
+		if jq -c --arg id "$CLIENT_ID" \
+			'{grant_type: "refresh_token", refresh_token: .claudeAiOauth.refreshToken, client_id: $id}' "$c" >"$tmp.request" &&
+			http "$TOKEN_URL" "$tmp.headers" "$tmp.request" >"$tmp.response" 2>/dev/null &&
+			jq --slurpfile r "$tmp.response" '
+				.claudeAiOauth.accessToken = $r[0].access_token
+				| .claudeAiOauth.expiresAt = ((now + $r[0].expires_in) * 1000 | floor)
+				| if $r[0].refresh_token then .claudeAiOauth.refreshToken = $r[0].refresh_token else . end
+				| if $r[0].scope then .claudeAiOauth.scopes = ($r[0].scope | split(" ")) else . end' "$c" >"$tmp.new" &&
+			[ -s "$tmp.new" ]; then
+			chmod 600 "$tmp.new"
+			mv "$tmp.new" "$c" # atomic replace
+		else
+			rc=1
+		fi
+		rm -f "$tmp.headers" "$tmp.request" "$tmp.response" "$tmp.new"
+	fi
+	unlock "$d.lock"
+	unlock "$d/.oauth_refresh.lock"
+	return $rc
+}
+
+# --- usage -------------------------------------------------------------------
+err_json() { printf '{"error":"%s"}\n' "$2" >"$1"; }
+
+fetch() { # fetch NAME: refresh the login if needed and store the usage reading
+	local a=$1 c=$ROOT/$1/.credentials.json out=$CACHE/$1.json st tok hf
+	if ! [ -s "$c" ]; then err_json "$out" "not logged in (csw login $a)"; return 0; fi
+	st=$(login_state "$c") || st='ok '
+	if [ "${st%% *}" = expiring ]; then
+		if ! refresh "$a"; then err_json "$out" "login expired (csw login $a)"; return 0; fi
+		st=$(login_state "$c") || st='ok '
+	fi
+	tok=${st#* }
+	[ -n "$tok" ] || { err_json "$out" "no token (csw login $a)"; return 0; }
+	# printf is a builtin, so the token reaches the private header file without argv
+	hf=$CACHE/.headers.$a.$$
+	printf 'Authorization: Bearer %s\nanthropic-beta: %s\n' "$tok" "$BETA" >"$hf"
+	if http "$USAGE_URL" "$hf" >"$out.tmp" 2>/dev/null && jq -e . "$out.tmp" >/dev/null 2>&1; then
+		mv "$out.tmp" "$out"
+	else
+		rm -f "$out.tmp"
+		err_json "$out" "usage unavailable (network or rate limit)"
+	fi
+	rm -f "$hf"
+}
+
+# Refetch readings that are missing or older than $TTL (all of them with "force"),
+# in parallel. Freshness comes from one stat call for every cached reading.
+fetch_all() {
+	local a m f now stale=''
+	load_accounts
+	[ -n "$ACCOUNTS" ] || return 0
+	[ -d "$CACHE" ] || mkdir -p "$CACHE"
+	if [ "${1-}" = force ] || [ "$TTL" -le 0 ]; then
+		stale=" $ACCOUNTS "
+	else
+		set --
+		for a in $ACCOUNTS; do
+			if [ -s "$CACHE/$a.json" ]; then set -- "$@" "$CACHE/$a.json"; else stale="$stale $a "; fi
+		done
+		if [ $# -gt 0 ]; then
+			now=$(date +%s)
+			while read -r m f; do
+				a=${f##*/}
+				a=${a%.json}
+				[ $((now - m)) -lt "$TTL" ] || stale="$stale $a "
+			done <<EOF
+$(stat -c '%Y %n' "$@" 2>/dev/null || stat -f '%m %N' "$@" 2>/dev/null)
+EOF
+		fi
+	fi
+	[ -n "${stale# }" ] || return 0
+	need_http
+	for a in $stale; do fetch "$a" & done
+	wait
+}
+
+# one TSV row per account (name 5h% 5h-reset 7d% 7d-reset note), one jq call for all
+rows() {
+	local a running=' '
+	load_accounts
+	load_current
+	set --
+	for a in $ACCOUNTS; do
+		[ -s "$CACHE/$a.json" ] || err_json "$CACHE/$a.json" "no reading yet"
+		if in_use "$a"; then running="$running$a "; fi
+		set -- "$@" "$CACHE/$a.json"
+	done
+	[ $# -gt 0 ] || return 0
+	jq -r --arg cur "$CUR" --arg running "$running" '
+		def rst(w): (w.resets_at // null) as $r | if $r == null then "" else
+			(try ($r | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch null) as $t |
+			if $t == null then $r else ($t - now) as $s |
+				if $s < 0 then "now"
+				elif $s < 3600 then "in \($s / 60 | floor)m"
+				elif $s < 86400 then "in \($s / 3600 | floor)h\(($s % 3600) / 60 | floor | tostring | if length < 2 then "0" + . else . end)m"
+				else ($t | strflocaltime("%a %H:%M")) end end end;
+		def pct(w): if (w.utilization // null) == null then "-" else "\(w.utilization | floor)%" end;
+		(input_filename | sub(".*/"; "") | sub("\\.json$"; "")) as $a
+		| ([if $a == $cur then "current" else empty end,
+		    if ($running | contains(" " + $a + " ")) then "running" else empty end] | join(", ")) as $note
+		| if .error then [$a, "-", "", "-", "", .error] else
+			[$a, pct(.five_hour), rst(.five_hour), pct(.seven_day), rst(.seven_day), $note] end
+		| @tsv' "$@"
+}
+
+table() { # table [color]
+	rows | awk -F '\t' -v color="${1-}" '
+		function bar(p,  n, s, i) { if (p == "-") return "          "; n = int(p / 10 + 0.5); s = "";
+			for (i = 0; i < 10; i++) s = s (i < n ? "#" : "."); return s }
+		function col(p, s) { if (color == "" || p == "-") return s;
+			p += 0; return (p >= 80 ? "\033[31m" : p >= 50 ? "\033[33m" : "\033[32m") s "\033[0m" }
+		BEGIN { printf "  %-10s %-15s %-9s  %-15s %-9s  %s\n", "ACCOUNT", "5-HOUR", "RESETS", "7-DAY", "RESETS", "" }
+		{ mark = ($6 ~ /current/) ? "*" : " "
+		  printf "%s %-10s %s %4s  %-9s  %s %4s  %-9s  %s\n", mark, $1,
+		    col($2, bar($2)), $2, $3, col($4, bar($4)), $4, $5, $6 }'
+}
+
+best() { # print the logged-in account with the lowest 5h use (ties: lowest 7d), one jq call
+	local a
+	load_accounts
+	set --
+	for a in $ACCOUNTS; do [ ! -s "$CACHE/$a.json" ] || set -- "$@" "$CACHE/$a.json"; done
+	[ $# -gt 0 ] || return 0
+	jq -rn '[inputs as $d | (input_filename | sub(".*/"; "") | sub("\\.json$"; "")) as $a | $d
+		| select(.error == null and (.five_hour.utilization // null) != null and (.seven_day.utilization // 0) < 100)
+		| {a: $a, u: .five_hour.utilization, w: (.seven_day.utilization // 0)}]
+		| sort_by(.u, .w) | .[0].a // empty' "$@"
+}
+
+# --- commands ----------------------------------------------------------------
+cmd_run() {
+	local cur th u b
+	load_current
+	if [ -z "$CUR" ]; then
+		warn "no accounts yet (csw add NAME); starting plain Claude"
+		has claude || die "claude is not installed: https://docs.claude.com/en/docs/claude-code/setup"
+		exec claude "$@"
+	fi
+	if [ -r "$STATE/auto" ]; then
+		if has jq && { has curl || has wget; }; then
+			cur=$CUR
+			read -r th <"$STATE/auto" || true
+			fetch_all
+			u=$(jq -r '.five_hour.utilization // 0 | floor' "$CACHE/$cur.json" 2>/dev/null) || u=0
+			if [ "${u:-0}" -ge "${th:-101}" ]; then
+				fetch_all force
+				b=$(best)
+				if [ -n "$b" ] && [ "$b" != "$cur" ]; then
+					warn "$cur is at $u% (>= $th%), switching to $b"
+					set_current "$b"
+				fi
+			fi
+		else
+			warn "auto-switch skipped: needs jq and curl or wget ($(install_hint jq curl))"
+		fi
+	fi
+	[ -L "$ROOT/$CUR/projects" ] || link "$CUR"
+	has claude || die "claude is not installed: https://docs.claude.com/en/docs/claude-code/setup"
+	CLAUDE_CONFIG_DIR=$ROOT/$CUR
+	export CLAUDE_CONFIG_DIR
+	exec claude "$@"
+}
+
+cmd_pick() {
+	local me out key a
+	need_net
+	load_accounts
+	[ -n "$ACCOUNTS" ] || die "no accounts yet: csw add NAME"
+	fetch_all
+	if has fzf && [ -t 0 ] && [ -t 1 ]; then
+		me=$(self)
+		out=$(table color | fzf --ansi --header-lines=1 --no-sort --layout=reverse --height=60% \
+			--prompt='account> ' --info=hidden \
+			--header='enter: use · ctrl-o: use + start claude · ctrl-b: best · ctrl-r: refresh · esc: quit' \
+			--bind "ctrl-r:reload(CSW_TTL=0 '$me' ls --color)" \
+			--bind "ctrl-b:execute-silent('$me' best)+reload('$me' ls --color)" \
+			--expect=enter,ctrl-o) || return 0
+		key=${out%%
+*}
+		a=$(printf '%s\n' "$out" | sed -n '2{s/\x1b\[[0-9;]*m//g;p;}' | awk '{ print ($1 == "*") ? $2 : $1 }')
+		[ -n "$a" ] || return 0
+		set_current "$a"
+		echo "csw: now using $a"
+		if [ "$key" = ctrl-o ]; then cmd_run; fi
+	else
+		has fzf || warn "tip: for an interactive picker: $(install_hint fzf)"
+		table
+		load_current
+		printf 'account to use (empty = keep %s): ' "$CUR"
+		read -r a || return 0
+		[ -n "$a" ] || return 0
+		[ -d "$ROOT/$a" ] || die "no account '$a'"
+		set_current "$a"
+		echo "csw: now using $a"
+	fi
+}
+
+# `csw init SHELL` prints a `claude` function. With auto-switch off and the current
+# account set up, it starts Claude directly using only shell builtins, without
+# starting csw at all. Otherwise it hands over to `csw run`.
+cmd_init() {
+	case ${1-} in
+	sh | bash | dash | zsh | ash)
+		cat <<'EOF'
+# csw: `claude` uses the current account (fast path: no extra process)
+claude() {
+	_csw_s=${XDG_STATE_HOME:-$HOME/.local/state}/claude-accounts
+	_csw_r=${XDG_DATA_HOME:-$HOME/.local/share}/claude-accounts
+	_csw_a=
+	[ -e "$_csw_s/auto" ] || { [ -r "$_csw_s/current" ] && read -r _csw_a <"$_csw_s/current"; }
+	if [ -n "$_csw_a" ] && [ -L "$_csw_r/$_csw_a/projects" ]; then
+		CLAUDE_CONFIG_DIR=$_csw_r/$_csw_a command claude "$@"
+	else
+		csw run "$@"
+	fi
+}
+EOF
+		;;
+	fish)
+		cat <<'EOF'
+# csw: `claude` uses the current account (fast path: no extra process)
+function claude --description 'Claude Code on the current csw account'
+    set -l s (set -q XDG_STATE_HOME; and echo $XDG_STATE_HOME; or echo $HOME/.local/state)/claude-accounts
+    set -l r (set -q XDG_DATA_HOME; and echo $XDG_DATA_HOME; or echo $HOME/.local/share)/claude-accounts
+    set -l a
+    if not test -e $s/auto; and test -r $s/current
+        read a <$s/current # no -l: -l here would scope `a` to this if-block
+    end
+    if test -n "$a"; and test -L $r/$a/projects
+        CLAUDE_CONFIG_DIR=$r/$a command claude $argv
+    else
+        csw run $argv
+    end
+end
+EOF
+		;;
+	*) die "usage: csw init sh|fish   (then: eval \"\$(csw init sh)\" in ~/.shrc / ~/.bashrc, or csw init fish | source in config.fish)" ;;
+	esac
+}
+
+cmd_doctor() {
+	local c v bad=0 a
+	echo "csw $CSW_VERSION"
+	for c in claude jq curl wget fzf; do
+		if has "$c"; then
+			v=$("$c" --version 2>/dev/null | head -n 1) || v=''
+			printf '  ok       %-7s %s\n' "$c" "$v"
+		else
+			case $c in
+			claude | jq) printf '  MISSING  %-7s %s\n' "$c" "$(install_hint "$c")"; bad=1 ;;
+			*) printf '  -        %-7s not installed\n' "$c" ;;
+			esac
+		fi
+	done
+	has curl || has wget || { echo "  MISSING  curl or wget: $(install_hint curl)"; bad=1; }
+	if has jq && ! jq -n '"2026-01-01T00:00:00Z" | fromdateiso8601 | strflocaltime("%H")' >/dev/null 2>&1; then
+		echo "  PROBLEM  jq is older than 1.6: $(install_hint jq)"
+		bad=1
+	fi
+	load_accounts
+	load_current
+	echo "accounts in $ROOT:"
+	[ -n "$ACCOUNTS" ] || echo "  (none: csw add NAME)"
+	for a in $ACCOUNTS; do
+		printf '  %-10s login:%-4s shared:%-4s%s\n' "$a" \
+			"$([ -s "$ROOT/$a/.credentials.json" ] && echo yes || echo NO)" \
+			"$([ -L "$ROOT/$a/projects" ] && echo yes || echo NO)" \
+			"$([ "$a" = "$CUR" ] && echo '  (current)' || true)"
+	done
+	if [ -n "$(find "$ROOT" "$STATE" "$CACHE" -type f -perm /077 2>/dev/null | head -n 1)" ]; then
+		echo "  PROBLEM  some csw files are readable by others: chmod -R go-rwx $ROOT $STATE $CACHE"
+		bad=1
+	fi
+	[ "$bad" = 0 ] && echo "all good" || return 1
+}
+
+usage() { sed -n '4,/^set -eu/p' "$(self)" | sed '$d; s/^# \{0,1\}//'; }
+
+main() {
+	local b d ans
+	case ${1-} in
+	'') cmd_pick ;;
+	ls | list)
+		need_net
+		fetch_all
+		if [ "${2-}" = --color ] || [ -t 1 ]; then table color; else table; fi
+		;;
+	watch)
+		need_net
+		while :; do
+			fetch_all
+			printf '\033[H\033[2J%s\n' "$(date '+%H:%M:%S')"
+			table color
+			sleep "${2:-$TTL}"
+		done
+		;;
+	use)
+		valid_name "${2-}"
+		[ -d "$ROOT/$2" ] || die "no account '$2' (csw ls)"
+		set_current "$2"
+		echo "csw: now using $2"
+		;;
+	best)
+		need_net
+		fetch_all
+		b=$(best)
+		[ -n "$b" ] || die "no account with a usage reading (csw ls)"
+		set_current "$b"
+		echo "csw: now using $b"
+		;;
+	run)
+		shift
+		cmd_run "$@"
+		;;
+	auto)
+		[ -d "$STATE" ] || mkdir -p "$STATE"
+		case ${2-} in
+		off) rm -f "$STATE/auto"; echo "csw: auto-switch off" ;;
+		'') if [ -r "$STATE/auto" ]; then echo "csw: auto-switch at $(cat "$STATE/auto")% (5-hour)"; else echo "csw: auto-switch off"; fi ;;
+		*[!0-9]*) die "usage: csw auto [PERCENT|off]" ;;
+		*) echo "$2" >"$STATE/auto"; echo "csw: on start, switch away at >= $2% 5-hour use" ;;
+		esac
+		;;
+	add)
+		valid_name "${2-}"
+		need claude
+		[ ! -e "$ROOT/$2" ] || die "account '$2' exists (csw login $2 to sign in again)"
+		link "$2"
+		[ -s "$STATE/current" ] || set_current "$2"
+		echo "csw: account '$2' created; signing in..."
+		CLAUDE_CONFIG_DIR=$ROOT/$2 claude auth login
+		;;
+	login)
+		valid_name "${2-}"
+		need claude
+		[ -d "$ROOT/$2" ] || die "no account '$2' (csw add $2)"
+		CLAUDE_CONFIG_DIR=$ROOT/$2 claude auth login
+		;;
+	rm | remove)
+		valid_name "${2-}"
+		d=$ROOT/$2
+		[ -d "$d" ] || die "no account '$2'"
+		if in_use "$2"; then die "'$2' has a running Claude session; close it first"; fi
+		printf 'Forget account %s (its login on this machine; shared history stays)? Type the name: ' "$2"
+		read -r ans || ans=''
+		[ "$ans" = "$2" ] || die "cancelled"
+		rm -rf "$d" "$d.lock" "$CACHE/$2.json"
+		load_current
+		[ "$CUR" != "$2" ] || rm -f "$STATE/current"
+		echo "csw: forgot $2"
+		;;
+	relink)
+		load_accounts
+		for d in $ACCOUNTS; do link "$d" && echo "shared: $d"; done
+		;;
+	doctor) cmd_doctor ;;
+	init) cmd_init "${2-}" ;;
+	version | --version | -V) echo "csw $CSW_VERSION" ;;
+	-h | --help | help) usage ;;
+	*) die "unknown command '$1' (csw help)" ;;
+	esac
+}
+
+# Everything runs from main on the last line, so the shell has read the whole file
+# before anything runs: a truncated download or an update while csw waits on a
+# login can't make it run half-changed code.
+{ main "$@" || exit 1; } && exit 0

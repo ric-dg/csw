@@ -1,0 +1,77 @@
+name: upstream
+# Daily, without credentials: are the endpoints and Claude Code values csw relies on
+# unchanged? Outcomes of tests/upstream.sh:
+#   0  all good
+#   3  Claude Code changed values csw copies -> patch csw, run the full test suite,
+#      and open a pull request for a human to review (never merged automatically)
+#   1  something needs a human -> open or update an issue labelled upstream-drift
+on:
+  schedule:
+    # 06:17 UTC daily, off the hour (GitHub delays runs scheduled on the hour)
+    - cron: '17 6 * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: upstream
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write       # push the update branch
+      pull-requests: write  # open the PR
+      issues: write         # report drift that needs a human
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true   # this job pushes a branch
+      - name: Check endpoints and the latest Claude Code
+        id: check
+        run: |
+          set +e
+          UPSTREAM_ENV=changed.env sh tests/upstream.sh >upstream.txt 2>&1
+          rc=$?
+          cat upstream.txt
+          echo "rc=$rc" >>"$GITHUB_OUTPUT"
+      - name: Patch csw and run the full test suite
+        id: patch
+        if: steps.check.outputs.rc == '3'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq dash busybox jq shellcheck fish
+          sh tools/apply-upstream.sh changed.env
+          shellcheck csw
+          SHELLS="dash bash busybox-ash" sh tests/run.sh
+      - name: Open a pull request
+        if: steps.check.outputs.rc == '3' && steps.patch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # one branch per distinct change, so a change seen on several days opens one PR
+          branch=upstream/$(sha256sum changed.env | cut -c1-12)
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "branch $branch already proposed"; exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git commit -am "Update endpoint values from the latest Claude Code"
+          git push origin "$branch"
+          {
+            echo 'Claude Code changed values that csw copies. This PR updates them; the full test suite passed in the workflow (CI does not re-run on bot PRs: close and reopen to trigger it).'
+            echo; echo '```'; cat upstream.txt; echo '```'
+            echo; echo 'Before merging: try `csw ls` with a real account.'
+          } >pr.md
+          gh label create upstream-drift --color B60205 --description 'Anthropic changed something csw relies on' --force
+          gh pr create --head "$branch" --title "Upstream: update endpoint values ($(date -u +%F))" --body-file pr.md --label upstream-drift
+      - name: Report drift that needs a human
+        if: always() && (steps.check.outputs.rc == '1' || steps.patch.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create upstream-drift --color B60205 --description 'Anthropic changed something csw relies on' --force
+          n=$(gh issue list --label upstream-drift --state open --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then gh issue comment "$n" --body-file upstream.txt
+          else gh issue create --label upstream-drift --title "Upstream drift needs attention ($(date -u +%F))" --body-file upstream.txt; fi
+          exit 1
