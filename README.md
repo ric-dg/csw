@@ -6,9 +6,10 @@ conversations, whichever account you're on.
 
 ```
 $ csw ls
-  ACCOUNT    5-HOUR          RESETS     7-DAY           RESETS     MODEL 7-DAY
-* work       ###.......  26%  in 2h54m   #########.  86%  in 4h44m   Fable 0%      current
-  personal   #.........   7%  in 3h04m   ..........   3%  Fri 04:00  Fable 3%
+  ACCOUNT    5-HOUR          RESETS                7-DAY           RESETS                MODEL 7-DAY
+* work       ####......  37%  Nov 13 13:09 (2h49m)  #########.  88%  Nov 13 14:59 (4h39m)  Fable 0%      current
+  personal   #.........   7%  Nov 13 13:20 (2h59m)  ..........   3%  Nov 20 04:00 (6d17h)  Fable 3%
+times in PST (UTC+08:00) · 10:20 here = 02:20 UTC · csw ls --utc for UTC
 ```
 
 - **A single POSIX `sh` script.** Needs `jq` and `curl` or `wget` (optionally `fzf`);
@@ -65,7 +66,7 @@ csw init fish | source       # in ~/.config/fish/config.fish
 | Command | What it does |
 |---|---|
 | `csw` | Interactive picker with every account's limits (fzf; plain menu without it). **Enter** use · **Ctrl-O** use and start Claude · **Ctrl-B** best · **Ctrl-R** refresh |
-| `csw ls` | Table of 5-hour / 7-day usage and reset times, plus per-model weekly limits (e.g. Fable) when an account has them |
+| `csw ls [--utc]` | Table of 5-hour / 7-day usage with reset date, time and countdown, plus per-model weekly limits (e.g. Fable) when an account has them. Local time with its UTC offset, or UTC with `--utc` |
 | `csw watch [SEC]` | The same table, redrawn every SEC seconds (default 120) |
 | `csw use NAME` | Make NAME the current account |
 | `csw best` | Switch to the account with the most 5-hour room left |

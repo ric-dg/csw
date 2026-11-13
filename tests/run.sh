@@ -78,6 +78,10 @@ run_suite() { # run_suite SHELL CLIENT: runs in a subshell; prints its own count
 	check "ls shows the per-model column when an account has one" has_text "$out" 'MODEL 7-DAY'
 	check "ls shows z's Fable weekly limit" has_text "$out" 'z .*Fable 7%'
 	check "ls shows - for an account without per-model limits" has_text "$out" 'y .*33%.* - '
+	check "ls footer names the time zone with its UTC offset" has_text "$out" 'times in .*(UTC[+-][0-9][0-9]:[0-9][0-9])'
+	out=$(CSW_TTL=99999 c ls --utc 2>/dev/null)
+	check "ls --utc shows the reset date and time in UTC" has_text "$out" 'x .*Jan 01 00:00 (.*Jan 05 00:00 ('
+	check "ls --utc footer says UTC" has_text "$out" '^times in UTC'
 	check "refresh saved the new access token" grep -q SECRET-fresh "$R/x/.credentials.json"
 	check "refresh saved the rotated refresh token" grep -q REFRESH-rotated "$R/x/.credentials.json"
 	check "refreshed login stays mode 600" [ "$(stat -c %a "$R/x/.credentials.json")" = 600 ]
