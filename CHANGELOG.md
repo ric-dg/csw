@@ -5,6 +5,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
+### Added
+- Per-model weekly limits (the usage reply's `weekly_scoped` entries, e.g. "Fable 3%")
+  in `csw ls`, `csw watch` and the picker, as a **MODEL 7-DAY** column. It appears
+  only when some account has such a limit, and shows `-` for accounts without one.
+  Model names come from the reply, so new models show up without a csw update.
+- Reset times now show the **date and time** plus the countdown, e.g.
+  `Nov 20 04:00 (6d17h)`, rounded to the minute like `/usage`. A footer names the time
+  zone with its UTC offset and shows local time next to UTC. `--utc` (for `ls`, `watch`
+  and the picker) shows everything in UTC.
+
 ## [0.1.0] - 2026-11-13
 
 ### Added

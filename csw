@@ -4,9 +4,10 @@
 # csw: one shared Claude Code across several accounts. See every account's limits,
 # pick one, and keep going in the same conversations.
 #
-#   csw                 interactive picker with every account's limits (fzf; plain menu without it)
-#   csw ls              table: 5-hour and 7-day usage and when they reset
-#   csw watch [SEC]     live table, refreshed every SEC seconds (default 120)
+#   csw [--utc]         interactive picker with every account's limits (fzf; plain menu without it)
+#   csw ls [--utc]      table: 5-hour, 7-day and per-model usage, reset date/time + countdown
+#                       (local time with its UTC offset; --utc shows UTC)
+#   csw watch [SEC] [--utc]  live table, refreshed every SEC seconds (default 120)
 #   csw use NAME        make NAME the account `claude` uses
 #   csw best            switch to the account with the most 5-hour room left
 #   csw run [ARGS]      start Claude with the current account (alias claude='csw run')
@@ -34,7 +35,7 @@
 set -eu
 umask 077 # everything csw creates (logins, caches, temp files) is private
 
-CSW_VERSION=0.1.0
+CSW_VERSION=0.2.0
 SHARED=${CSW_SHARED:-$HOME/.claude}
 ROOT=${XDG_DATA_HOME:-$HOME/.local/share}/claude-accounts
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/claude-accounts
@@ -320,7 +321,9 @@ EOF
 	wait
 }
 
-# one TSV row per account (name 5h% 5h-reset 7d% 7d-reset note), one jq call for all
+# one TSV row per account (name 5h% 5h-reset 7d% 7d-reset per-model note), one jq call for all.
+# per-model = the reply's weekly_scoped limits (e.g. "Fable 3%"), by display name, so a
+# model Anthropic adds later shows up too; "-" when the account has none.
 rows() {
 	local a running=' '
 	load_accounts
@@ -333,32 +336,59 @@ rows() {
 	done
 	[ $# -gt 0 ] || return 0
 	jq -r --arg cur "$CUR" --arg running "$running" '
+		def rel($s): if $s < 0 then "now"
+			elif $s < 3600 then "\($s / 60 | floor)m"
+			elif $s < 86400 then "\($s / 3600 | floor)h\(($s % 3600) / 60 | floor | tostring | if length < 2 then "0" + . else . end)m"
+			else "\($s / 86400 | floor)d\(($s % 86400) / 3600 | floor)h" end;
+		# "Nov 13 13:20 (2h54m)": local time (or UTC with --utc, via TZ) plus the countdown
 		def rst(w): (w.resets_at // null) as $r | if $r == null then "" else
 			(try ($r | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch null) as $t |
-			if $t == null then $r else ($t - now) as $s |
-				if $s < 0 then "now"
-				elif $s < 3600 then "in \($s / 60 | floor)m"
-				elif $s < 86400 then "in \($s / 3600 | floor)h\(($s % 3600) / 60 | floor | tostring | if length < 2 then "0" + . else . end)m"
-				else ($t | strflocaltime("%a %H:%M")) end end end;
+			# round to the nearest minute: resets arrive as e.g. 19:59:59.8 (shown as 20:00, like /usage)
+			if $t == null then $r else "\($t + 30 | strflocaltime("%b %d %H:%M")) (\(rel($t - now)))" end end;
 		def pct(w): if (w.utilization // null) == null then "-" else "\(w.utilization | floor)%" end;
+		def scoped: [.limits[]? | select(.kind == "weekly_scoped" and (.percent // null) != null)
+			| "\(.scope.model.display_name // "model") \(.percent | floor)%"] | if length == 0 then "-" else join(" · ") end;
 		(input_filename | sub(".*/"; "") | sub("\\.json$"; "")) as $a
 		| ([if $a == $cur then "current" else empty end,
 		    if ($running | contains(" " + $a + " ")) then "running" else empty end] | join(", ")) as $note
-		| if .error then [$a, "-", "", "-", "", .error] else
-			[$a, pct(.five_hour), rst(.five_hour), pct(.seven_day), rst(.seven_day), $note] end
+		| if .error then [$a, "-", "", "-", "", "-", .error] else
+			[$a, pct(.five_hour), rst(.five_hour), pct(.seven_day), rst(.seven_day), scoped, $note] end
 		| @tsv' "$@"
+}
+
+# which clock the RESETS column uses; "PST" alone is ambiguous, so show the offset too
+tz_note() {
+	local z off
+	if [ "${CSW_UTC-}" = 1 ]; then echo "times in UTC (csw ls without --utc: local time)"; return; fi
+	z=$(date '+%Z %z %H:%M')
+	off=${z#* }
+	off=${off%% *}
+	printf 'times in %s (UTC%s:%s) · %s here = %s UTC · csw ls --utc for UTC\n' \
+		"${z%% *}" "${off%??}" "${off#???}" "${z##* }" "$(date -u +%H:%M)"
 }
 
 table() { # table [color]
 	rows | awk -F '\t' -v color="${1-}" '
+		# buffer the rows: the MODEL 7-DAY column only appears if some account has one
+		{ row[NR] = $0; if ($6 != "-") scoped = 1 }
+		END {
+			printf "  %-10s %-15s %-20s  %-15s %-20s  ", "ACCOUNT", "5-HOUR", "RESETS", "7-DAY", "RESETS"
+			if (scoped) printf "%-14s", "MODEL 7-DAY"
+			printf "\n"
+			for (i = 1; i <= NR; i++) {
+				split(row[i], f, "\t")
+				mark = (f[7] ~ /current/) ? "*" : " "
+				printf "%s %-10s %s %4s  %-20s  %s %4s  %-20s  ", mark, f[1],
+					col(f[2], bar(f[2])), f[2], f[3], col(f[4], bar(f[4])), f[4], f[5]
+				if (scoped) printf "%-14s", f[6]
+				printf "%s\n", f[7]
+			}
+		}
 		function bar(p,  n, s, i) { if (p == "-") return "          "; n = int(p / 10 + 0.5); s = "";
 			for (i = 0; i < 10; i++) s = s (i < n ? "#" : "."); return s }
 		function col(p, s) { if (color == "" || p == "-") return s;
 			p += 0; return (p >= 80 ? "\033[31m" : p >= 50 ? "\033[33m" : "\033[32m") s "\033[0m" }
-		BEGIN { printf "  %-10s %-15s %-9s  %-15s %-9s  %s\n", "ACCOUNT", "5-HOUR", "RESETS", "7-DAY", "RESETS", "" }
-		{ mark = ($6 ~ /current/) ? "*" : " "
-		  printf "%s %-10s %s %4s  %-9s  %s %4s  %-9s  %s\n", mark, $1,
-		    col($2, bar($2)), $2, $3, col($4, bar($4)), $4, $5, $6 }'
+'
 }
 
 best() { # print the logged-in account with the lowest 5h use (ties: lowest 7d), one jq call
@@ -417,7 +447,8 @@ cmd_pick() {
 		me=$(self)
 		out=$(table color | fzf --ansi --header-lines=1 --no-sort --layout=reverse --height=60% \
 			--prompt='account> ' --info=hidden \
-			--header='enter: use · ctrl-o: use + start claude · ctrl-b: best · ctrl-r: refresh · esc: quit' \
+			--header="enter: use · ctrl-o: use + start claude · ctrl-b: best · ctrl-r: refresh · esc: quit
+$(tz_note)" \
 			--bind "ctrl-r:reload(CSW_TTL=0 '$me' ls --color)" \
 			--bind "ctrl-b:execute-silent('$me' best)+reload('$me' ls --color)" \
 			--expect=enter,ctrl-o) || return 0
@@ -523,21 +554,31 @@ cmd_doctor() {
 usage() { sed -n '4,/^set -eu/p' "$(self)" | sed '$d; s/^# \{0,1\}//'; }
 
 main() {
-	local b d ans
+	local b d ans sec
+	if [ "${1-}" = --utc ]; then CSW_UTC=1; shift; fi
+	case ${1-} in ls | list | watch) for b; do [ "$b" != --utc ] || CSW_UTC=1; done ;; esac
+	if [ "${CSW_UTC-}" = 1 ]; then
+		TZ=UTC0
+		export TZ CSW_UTC
+	fi
 	case ${1-} in
 	'') cmd_pick ;;
 	ls | list)
 		need_net
 		fetch_all
-		if [ "${2-}" = --color ] || [ -t 1 ]; then table color; else table; fi
+		case " $* " in *' --color '*) table color ;; *) if [ -t 1 ]; then table color; else table; fi ;; esac
+		tz_note
 		;;
 	watch)
 		need_net
+		sec=$TTL
+		for b in "$@"; do case $b in '' | *[!0-9]*) ;; *) sec=$b ;; esac; done
 		while :; do
 			fetch_all
 			printf '\033[H\033[2J%s\n' "$(date '+%H:%M:%S')"
 			table color
-			sleep "${2:-$TTL}"
+			tz_note
+			sleep "$sec"
 		done
 		;;
 	use)
