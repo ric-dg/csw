@@ -20,6 +20,7 @@ check() { # check DESCRIPTION COMMAND...
 	if "$@" >/dev/null 2>&1; then ok; else bad "$d"; fi
 }
 has_text() { printf '%s' "$1" | grep -q -- "$2"; }
+fails_text() { ! has_text "$@"; }
 
 # a bin dir with real tools, minus any HTTP client (each run adds exactly one fake)
 BASE=$(mktemp -d)
@@ -74,6 +75,9 @@ run_suite() { # run_suite SHELL CLIENT: runs in a subshell; prints its own count
 	check "ls shows y at 92%" has_text "$out" 'y .*92%'
 	check "ls shows z at 40%" has_text "$out" 'z .*40%'
 	check "ls says w is not logged in" has_text "$out" 'w .*not logged in'
+	check "ls shows the per-model column when an account has one" has_text "$out" 'MODEL 7-DAY'
+	check "ls shows z's Fable weekly limit" has_text "$out" 'z .*Fable 7%'
+	check "ls shows - for an account without per-model limits" has_text "$out" 'y .*33%.* - '
 	check "refresh saved the new access token" grep -q SECRET-fresh "$R/x/.credentials.json"
 	check "refresh saved the rotated refresh token" grep -q REFRESH-rotated "$R/x/.credentials.json"
 	check "refreshed login stays mode 600" [ "$(stat -c %a "$R/x/.credentials.json")" = 600 ]
@@ -85,6 +89,13 @@ run_suite() { # run_suite SHELL CLIENT: runs in a subshell; prints its own count
 	else
 		check "no token ever in argv" [ ! -s "$W/fake/leaks" ]
 	fi
+
+	# without any per-model limit the column is hidden (readings reused: no refetch)
+	cp "$W/cache/claude-accounts/z.json" "$W/z.keep"
+	jq 'del(.limits)' "$W/z.keep" >"$W/cache/claude-accounts/z.json"
+	out=$(CSW_TTL=99999 c ls 2>/dev/null)
+	check "per-model column hidden when no account has one" fails_text "$out" 'MODEL 7-DAY'
+	mv "$W/z.keep" "$W/cache/claude-accounts/z.json"
 
 	# best / use / auto / run
 	check "best picks the emptiest account" has_text "$(c best)" 'now using x'

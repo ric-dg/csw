@@ -34,7 +34,7 @@
 set -eu
 umask 077 # everything csw creates (logins, caches, temp files) is private
 
-CSW_VERSION=0.1.0
+CSW_VERSION=0.2.0
 SHARED=${CSW_SHARED:-$HOME/.claude}
 ROOT=${XDG_DATA_HOME:-$HOME/.local/share}/claude-accounts
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/claude-accounts
@@ -320,7 +320,9 @@ EOF
 	wait
 }
 
-# one TSV row per account (name 5h% 5h-reset 7d% 7d-reset note), one jq call for all
+# one TSV row per account (name 5h% 5h-reset 7d% 7d-reset per-model note), one jq call for all.
+# per-model = the reply's weekly_scoped limits (e.g. "Fable 3%"), by display name, so a
+# model Anthropic adds later shows up too; "-" when the account has none.
 rows() {
 	local a running=' '
 	load_accounts
@@ -341,24 +343,38 @@ rows() {
 				elif $s < 86400 then "in \($s / 3600 | floor)h\(($s % 3600) / 60 | floor | tostring | if length < 2 then "0" + . else . end)m"
 				else ($t | strflocaltime("%a %H:%M")) end end end;
 		def pct(w): if (w.utilization // null) == null then "-" else "\(w.utilization | floor)%" end;
+		def scoped: [.limits[]? | select(.kind == "weekly_scoped" and (.percent // null) != null)
+			| "\(.scope.model.display_name // "model") \(.percent | floor)%"] | if length == 0 then "-" else join(" · ") end;
 		(input_filename | sub(".*/"; "") | sub("\\.json$"; "")) as $a
 		| ([if $a == $cur then "current" else empty end,
 		    if ($running | contains(" " + $a + " ")) then "running" else empty end] | join(", ")) as $note
-		| if .error then [$a, "-", "", "-", "", .error] else
-			[$a, pct(.five_hour), rst(.five_hour), pct(.seven_day), rst(.seven_day), $note] end
+		| if .error then [$a, "-", "", "-", "", "-", .error] else
+			[$a, pct(.five_hour), rst(.five_hour), pct(.seven_day), rst(.seven_day), scoped, $note] end
 		| @tsv' "$@"
 }
 
 table() { # table [color]
 	rows | awk -F '\t' -v color="${1-}" '
+		# buffer the rows: the MODEL 7-DAY column only appears if some account has one
+		{ row[NR] = $0; if ($6 != "-") scoped = 1 }
+		END {
+			printf "  %-10s %-15s %-9s  %-15s %-9s  ", "ACCOUNT", "5-HOUR", "RESETS", "7-DAY", "RESETS"
+			if (scoped) printf "%-14s", "MODEL 7-DAY"
+			printf "\n"
+			for (i = 1; i <= NR; i++) {
+				split(row[i], f, "\t")
+				mark = (f[7] ~ /current/) ? "*" : " "
+				printf "%s %-10s %s %4s  %-9s  %s %4s  %-9s  ", mark, f[1],
+					col(f[2], bar(f[2])), f[2], f[3], col(f[4], bar(f[4])), f[4], f[5]
+				if (scoped) printf "%-14s", f[6]
+				printf "%s\n", f[7]
+			}
+		}
 		function bar(p,  n, s, i) { if (p == "-") return "          "; n = int(p / 10 + 0.5); s = "";
 			for (i = 0; i < 10; i++) s = s (i < n ? "#" : "."); return s }
 		function col(p, s) { if (color == "" || p == "-") return s;
 			p += 0; return (p >= 80 ? "\033[31m" : p >= 50 ? "\033[33m" : "\033[32m") s "\033[0m" }
-		BEGIN { printf "  %-10s %-15s %-9s  %-15s %-9s  %s\n", "ACCOUNT", "5-HOUR", "RESETS", "7-DAY", "RESETS", "" }
-		{ mark = ($6 ~ /current/) ? "*" : " "
-		  printf "%s %-10s %s %4s  %-9s  %s %4s  %-9s  %s\n", mark, $1,
-		    col($2, bar($2)), $2, $3, col($4, bar($4)), $4, $5, $6 }'
+'
 }
 
 best() { # print the logged-in account with the lowest 5h use (ties: lowest 7d), one jq call

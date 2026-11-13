@@ -5,6 +5,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
+### Added
+- Per-model weekly limits (the usage reply's `weekly_scoped` entries, e.g. "Fable 3%")
+  in `csw ls`, `csw watch` and the picker, as a **MODEL 7-DAY** column. It appears
+  only when some account has such a limit, and shows `-` for accounts without one.
+  Model names come from the reply, so new models show up without a csw update.
+
 ## [0.1.0] - 2026-11-13
 
 ### Added

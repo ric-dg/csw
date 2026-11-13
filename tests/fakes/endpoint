@@ -13,6 +13,9 @@ case $url in
 	grep -q '^anthropic-beta: oauth-2025-04-20$' "$hdrs" || exit 22
 	case $tok in SECRET-*fail*) exit 22 ;; SECRET-*) ;; *) exit 22 ;; esac
 	case $tok in *busy*) u=92 ;; *mid*) u=40 ;; *) u=10 ;; esac
-	printf '{"five_hour":{"utilization":%s,"resets_at":"2099-01-01T00:00:00.000000+00:00"},"seven_day":{"utilization":33.0,"resets_at":"2099-01-05T00:00:00+00:00"}}\n' "$u" ;;
+	# the "mid" account also has a per-model weekly limit, shaped like the real reply
+	scoped=''
+	case $tok in *mid*) scoped=',"limits":[{"kind":"session","percent":40},{"kind":"weekly_scoped","percent":7.4,"resets_at":"2099-01-05T00:00:00+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}]' ;; esac
+	printf '{"five_hour":{"utilization":%s,"resets_at":"2099-01-01T00:00:00.000000+00:00"},"seven_day":{"utilization":33.0,"resets_at":"2099-01-05T00:00:00+00:00"}%s}\n' "$u" "$scoped" ;;
 *) exit 6 ;;
 esac
